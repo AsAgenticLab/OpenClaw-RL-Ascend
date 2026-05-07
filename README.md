@@ -294,7 +294,7 @@ We also provide an interesting case for evaluation. A student who uses OpenClaw 
 <summary><b>Evaluation Setting</b> — Both student, TA and teacher use AI!</summary>
 
 
-[![Overview](assets/example.png)](assets/example.pdf)
+<img src="assets/example.png" alt="Overview" width="750">
 
 See [`./openclaw-test/README.md`](./openclaw-test/README.md) for setup and algorithm details. Example of evaluation [results](https://github.com/Gen-Verse/OpenClaw-RL/blob/main/openclaw-test/results.txt).
 </details>
