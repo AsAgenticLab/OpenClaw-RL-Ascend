@@ -96,6 +96,9 @@ from slime.backends.megatron_utils.loss import get_log_probs_and_entropy, get_re
 from slime.utils.ppo_utils import compute_approx_kl, compute_policy_loss
 
 
+_PPO_KL_CLAMP = 20.0
+
+
 def _w_rl() -> float:
     return float(os.environ.get("OPENCLAW_TOPK_W_RL", "1.0"))
 
@@ -166,7 +169,8 @@ def openclaw_topk_select_loss_function(
     eps_lo = _eps_clip_lo(args)
     eps_hi = _eps_clip_hi(args)
     diff_clip = _adv_diff_clip()
-    need_entropy_for_loss = args.entropy_coef != 0.0
+    entropy_coef = float(getattr(args, "entropy_coef", 0.0) or 0.0)
+    need_entropy_for_loss = entropy_coef != 0.0
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -193,7 +197,13 @@ def openclaw_topk_select_loss_function(
     ppo_kl_mean_sampled = torch.zeros((), device=logits.device, dtype=torch.float32)
     if w_rl != 0.0:
         old_log_probs = torch.cat(batch["log_probs"], dim=0)
-        ppo_kl_sampled = old_log_probs - new_log_probs
+        # Match the OPD branch's verl-style guard before compute_policy_loss()
+        # exponentiates the log-ratio. Without this, a deterministic outlier
+        # batch can produce inf * 0 -> NaN for OPD-only / zero-advantage tokens.
+        ppo_kl_sampled = (old_log_probs - new_log_probs).clamp(
+            min=-_PPO_KL_CLAMP,
+            max=_PPO_KL_CLAMP,
+        )
         rl_advantages = torch.cat(batch["advantages"], dim=0)
         pg_loss_tokens, pg_clipfrac_tokens = compute_policy_loss(
             ppo_kl_sampled, rl_advantages, eps_lo, eps_hi
@@ -433,28 +443,21 @@ def openclaw_topk_select_loss_function(
         entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
         entropy_loss = sum_of_sample_mean(entropy)
     else:
-        with torch.no_grad():
-            _, ent_data = get_log_probs_and_entropy(
-                logits,
-                args=args,
-                unconcat_tokens=batch["unconcat_tokens"],
-                total_lengths=total_lengths,
-                response_lengths=response_lengths,
-                with_entropy=True,
-                max_seq_lens=max_seq_lens,
-            )
-            entropy_loss = sum_of_sample_mean(torch.cat(ent_data["entropy"], dim=0))
+        entropy_loss = torch.zeros((), device=logits.device, dtype=torch.float32)
 
-    loss = w_rl * grpo_pg_loss + w_opd * opd_loss - args.entropy_coef * entropy_loss
+    loss = w_rl * grpo_pg_loss + w_opd * opd_loss
+    if entropy_coef != 0.0:
+        loss = loss - entropy_coef * entropy_loss
 
     kl_loss = torch.tensor(0.0, device=logits.device)
-    if args.use_kl_loss and batch.get("ref_log_probs") is not None:
+    kl_loss_coef = float(getattr(args, "kl_loss_coef", 0.0) or 0.0)
+    if args.use_kl_loss and batch.get("ref_log_probs") is not None and kl_loss_coef != 0.0:
         ref_log_probs = torch.cat(batch["ref_log_probs"], dim=0)
         kl = compute_approx_kl(
             new_log_probs, ref_log_probs, kl_loss_type=args.kl_loss_type,
         )
         kl_loss = sum_of_sample_mean(kl)
-        loss = loss + args.kl_loss_coef * kl_loss
+        loss = loss + kl_loss_coef * kl_loss
 
     if new_log_probs.numel() == 0:
         loss = loss + 0 * logits.sum()

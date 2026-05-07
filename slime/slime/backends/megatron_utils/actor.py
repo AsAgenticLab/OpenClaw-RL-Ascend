@@ -806,8 +806,8 @@ class MegatronTrainRayActor(TrainRayActor):
         feeds these indices to the PRM teacher actor's ``gather_at_indices``
         so the teacher's log-probs are aligned to the student's subset.
 
-        Returns a dict ``{"topk_indices": list[Tensor]}`` (CPU long tensors)
-        on every actor rank; the outer loop reads only rank 0's payload.
+        Returns CPU top-K tensors plus the local actor-DP partition metadata;
+        the outer loop merges one payload per DP rank into original order.
         """
         if self.args.offload_train:
             self.wake_up()
@@ -827,7 +827,12 @@ class MegatronTrainRayActor(TrainRayActor):
         out_indices = [t.cpu() if isinstance(t, torch.Tensor) else t for t in topk_indices]
         for iterator in data_iterator:
             iterator.reset()
-        return {"topk_indices": out_indices}
+        return {
+            "topk_indices": out_indices,
+            "partition": rollout_data.get("_partition"),
+            "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+            "dp_size": mpu.get_data_parallel_world_size(with_context_parallel=False),
+        }
 
     @staticmethod
     def _select_teacher_cand_per_sample(
@@ -1184,14 +1189,26 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 if hasattr(self, "_prm_teacher_log_probs") and self._prm_teacher_log_probs is not None:
                     payload = self._prm_teacher_log_probs
+                    local_partition = rollout_data.get("_partition")
+                    local_batch_size = len(rollout_data.get("tokens", []))
+
+                    def slice_teacher_payload(value):
+                        if (
+                            local_partition is not None
+                            and isinstance(value, list)
+                            and len(value) != local_batch_size
+                        ):
+                            return [value[idx] for idx in local_partition]
+                        return value
+
                     if isinstance(payload, dict):
                         # New (multi-key) shape: {prm_teacher_log_probs: [...],
                         # prm_teacher_topk_log_probs: [...], ...}
                         for k, v in payload.items():
-                            rollout_data[k] = v
+                            rollout_data[k] = slice_teacher_payload(v)
                     else:
                         # Legacy (single list) shape.
-                        rollout_data["prm_teacher_log_probs"] = payload
+                        rollout_data["prm_teacher_log_probs"] = slice_teacher_payload(payload)
                     self._prm_teacher_log_probs = None
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:

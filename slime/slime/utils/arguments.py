@@ -1389,8 +1389,35 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Number of PRM hint-generation rollouts per step. When unset "
                     "(default), falls back to --prm-m. Only consumed by the "
                     "retool-hybrid-select generate path (toolcall-rl/"
-                    "generate_with_retool_hybrid_select.py); ignored by the "
-                    "scalar-OPD / topk-OPD baselines."
+                    "generate_with_retool_hybrid_select.py) and by terminal-rl's "
+                    "topk-select rollout (terminal-rl/topk_select_generate.py); "
+                    "ignored by the scalar-OPD / topk-OPD baselines."
+                ),
+            )
+            parser.add_argument(
+                "--topk-select-fallback-to-unenhanced",
+                action="store_true",
+                default=False,
+                help=(
+                    "Per-Sample fallback for terminal-rl's topk-select rollout: "
+                    "when no hint survives for a turn, ship a single degenerate "
+                    "teacher_tokens_candidate equal to the un-enhanced "
+                    "(prompt + response) so slime's K-loop has something to "
+                    "forward through (the OPD gradient is then ~0 on that "
+                    "Sample). When unset, that Sample carries no "
+                    "teacher_tokens_candidates and the loss kernel falls back "
+                    "to pure GRPO for it. No effect on any other rollout path."
+                ),
+            )
+            parser.add_argument(
+                "--topk-select-min-hint-chars",
+                type=int,
+                default=10,
+                help=(
+                    "Survival filter for the topk-select hint judge: hints "
+                    "shorter than this many trimmed characters are dropped. "
+                    "Mirrors the legacy retool-hybrid-select behaviour. Only "
+                    "consumed by terminal-rl/topk_select_generate.py."
                 ),
             )
             parser.add_argument(
@@ -1448,6 +1475,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=2048,
                 help="Max new tokens for each PRM judge generation call.",
+            )
+            parser.add_argument(
+                "--prm-history-mode",
+                type=str,
+                default="head_tail",
+                choices=["last", "random", "head_tail"],
+                help=(
+                    "How the PRM judge selects prior turns when building its prompt: "
+                    "'last' = most recent k turns, 'random' = random sample of k turns, "
+                    "'head_tail' = first head_k + last tail_k turns."
+                ),
             )
             return parser
 
