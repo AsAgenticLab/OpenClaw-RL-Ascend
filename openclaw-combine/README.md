@@ -8,6 +8,8 @@ cd /data_storage/wyj/OpenClaw-RL/slime
 bash ../openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh
 ```
 
+Note that you MUST convert the hf format to torch list format before optimization. See details in comments of sh files.
+
 The older `openclaw_combine` launchers are kept for reference. The main path for
 the current experiments is `run_qwen3_4b_openclaw_topk_select.sh`, which uses
 multi-candidate hint generation, overlap-guided hint selection, and the custom
