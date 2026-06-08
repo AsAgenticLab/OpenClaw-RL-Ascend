@@ -11,6 +11,8 @@ import time
 from itertools import count
 from typing import Any
 
+_REQ_COUNTER = count(0)  # global request counter for log correlation
+
 import httpx
 import torch
 import uvicorn
@@ -84,6 +86,59 @@ def _extract_logprobs_from_chat_response(choice: dict[str, Any]) -> list[float]:
     if not isinstance(content, list):
         return []
     return [float(item.get("logprob", 0.0)) for item in content if isinstance(item, dict)]
+
+
+_GLM_XML_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+
+def _try_parse_glm_xml_tool_calls(content: str) -> list[dict] | None:
+    """Fallback parser for GLM-4.7's native XML-style tool call format:
+
+        <tool_call>function_name
+        <arg_key>param1</arg_key><arg_value>value1</arg_value>
+        </tool_call>
+
+    The qwen25 parser expects JSON inside <tool_call>, so it silently
+    produces empty calls when it encounters this format.  We detect it
+    by checking that the inner content does NOT start with '{'.
+
+    Returns a list of OpenAI-format tool_call dicts, or None if the
+    format is not recognised.
+    """
+    match = _GLM_XML_TOOL_CALL_RE.search(content)
+    if not match:
+        return None
+    inner = match.group(1).strip()
+    if inner.startswith("{"):
+        return None  # JSON format — let the normal parser handle it
+
+    name_match = re.match(r"^([^<\n\s]+)", inner)
+    if not name_match:
+        return None
+    name = name_match.group(1).strip()
+
+    keys = re.findall(r"<arg_key>(.*?)</arg_key>", inner, re.DOTALL)
+    values = re.findall(r"<arg_value>(.*?)</arg_value>", inner, re.DOTALL)
+
+    def _coerce(v: str):
+        s = v.strip()
+        if s.startswith(("[", "{")):
+            try:
+                return json.loads(s)
+            except json.JSONDecodeError:
+                pass
+        return s
+
+    params = {k.strip(): _coerce(v) for k, v in zip(keys, values)}
+    call_id = f"call_{name}_{int(time.time() * 1000)}"
+    return [{
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(params, ensure_ascii=False),
+        },
+    }]
 
 
 def _build_hint_judge_messages(response_text: str, next_state_text: str, next_state_role: str = "user") -> list[dict]:
@@ -339,6 +394,8 @@ class OpenClawOPDAPIServer:
             x_turn_type: str | None = Header(default=None),
             x_session_done: str | None = Header(default=None),
         ):
+            req_id = next(_REQ_COUNTER)
+            t0 = time.monotonic()
             owner: OpenClawOPDAPIServer = request.app.state.owner
             await owner._check_auth(authorization)
             if not owner.submission_enabled.is_set():
@@ -353,8 +410,31 @@ class OpenClawOPDAPIServer:
             )
 
             stream = bool(body.get("stream", False))
+
+            logger.info(
+                "[OpenClaw-OPD] >>> REQ#%d session=%s turn_type=%s stream=%s "
+                "model=%s max_tokens=%s temperature=%s n=%s msgs=%d "
+                "has_x_session_id=%s has_x_turn_type=%s",
+                req_id, session_id, turn_type, stream,
+                body.get("model", "-"), body.get("max_tokens", "-"),
+                body.get("temperature", "-"), body.get("n", 1),
+                len(body.get("messages", [])),
+                x_session_id is not None, x_turn_type is not None,
+            )
+            if session_id == "unknown" or turn_type == "side":
+                logger.warning(
+                    "[OpenClaw-OPD] REQ#%d WARNING: session_id=%r turn_type=%r — "
+                    "training extension headers missing? No training data will be collected.",
+                    req_id, session_id, turn_type,
+                )
+
             result = await owner._handle_request(
                 body, session_id=session_id, turn_type=turn_type, session_done=session_done
+            )
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "[OpenClaw-OPD] <<< REQ#%d session=%s turn_type=%s stream=%s elapsed=%.2fs",
+                req_id, session_id, turn_type, stream, elapsed,
             )
             if stream:
                 return StreamingResponse(owner._stream_response(result), media_type="text/event-stream")
@@ -731,6 +811,27 @@ class OpenClawOPDAPIServer:
         tool_calls = assistant_msg.get("tool_calls") or []
         content = assistant_msg.get("content") or ""
         reasoning = assistant_msg.get("reasoning_content") or ""
+
+        # Fallback: parse GLM-4.7's XML-style tool call when the normal parser
+        # (e.g. qwen25) returns empty tool_calls but content contains <tool_call>.
+        if not tool_calls and content and "<tool_call>" in content:
+            _parsed_calls = _try_parse_glm_xml_tool_calls(content)
+            if _parsed_calls:
+                tool_calls = _parsed_calls
+                _tc_start = content.find("<tool_call>")
+                content = content[:_tc_start].strip()
+                assistant_msg = dict(assistant_msg)
+                assistant_msg["tool_calls"] = tool_calls
+                assistant_msg["content"] = content or None
+                _choices = list(output.get("choices", []))
+                if _choices:
+                    _choices[0] = {**_choices[0], "message": assistant_msg, "finish_reason": "tool_calls"}
+                    output = {**output, "choices": _choices}
+                logger.info(
+                    "[OpenClaw-OPD] GLM XML tool call parsed and injected: %s",
+                    str(tool_calls)[:300],
+                )
+
         logger.info(
             "%s[OpenClaw-OPD] [%s] session=%s prompt_msgs=%d%s",
             _YELLOW,
