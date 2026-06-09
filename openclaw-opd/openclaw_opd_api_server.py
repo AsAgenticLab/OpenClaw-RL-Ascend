@@ -361,29 +361,36 @@ class OpenClawOPDAPIServer:
                 self._prm_tokenizer.vocab_size,
             )
 
-        # ---- Remote PRM configuration (optional, overrides local judge/eval/teacher) ----
+        # ---- Remote PRM configuration (optional) ----
+        # When configured, judge/eval votes are sent to a remote
+        # OpenAI-compatible API.  This is a pure text-in/text-out task
+        # — any model can serve as the judge/evaluator regardless of
+        # tokenizer vocabulary.
+        #
+        # Teacher log-probs ALWAYS use the local SGLang engine
+        # (self._prm_url) so that the per-token advantage calculation
+        # (teacher_lp - old_lp) works on identical token IDs.
         self._remote_prm_base_url = os.getenv("OPENCLAW_REMOTE_PRM_BASE_URL", "").rstrip("/")
         self._remote_prm_api_key = os.getenv("OPENCLAW_REMOTE_PRM_API_KEY", "")
         self._remote_judge_model = os.getenv("OPENCLAW_REMOTE_PRM_JUDGE_MODEL", "")
-        self._remote_teacher_model = os.getenv("OPENCLAW_REMOTE_PRM_TEACHER_MODEL", "")
 
         self._use_remote_judge = bool(self._remote_prm_base_url and self._remote_judge_model)
-        self._use_remote_teacher = bool(self._remote_prm_base_url and self._remote_teacher_model)
 
         if self._use_remote_judge:
             logger.info(
-                "[OpenClaw-OPD] Remote judge PRM enabled: url=%s/v1 model=%s m=%d",
+                "[OpenClaw-OPD] Remote judge/eval enabled: url=%s/v1 model=%s m=%d",
                 self._remote_prm_base_url, self._remote_judge_model, self._prm_m,
             )
-        if self._use_remote_teacher:
             logger.info(
-                "[OpenClaw-OPD] Remote teacher logprobs enabled: url=%s/v1 model=%s "
-                "(REQUIRES same tokenizer as student model for correct alignment)",
-                self._remote_prm_base_url, self._remote_teacher_model,
+                "[OpenClaw-OPD] Teacher logprobs will use local SGLang engine %s "
+                "(same vocab as student → token-aligned advantage)",
+                self._prm_url,
             )
-        elif self._use_remote_judge:
+        else:
             logger.info(
-                "[OpenClaw-OPD] Remote teacher NOT configured; teacher logprobs will use local PRM SGLang engine.",
+                "[OpenClaw-OPD] All PRM functions (judge + eval + teacher) "
+                "use local SGLang engine: url=%s m=%d",
+                self._prm_url, self._prm_m,
             )
 
         self._record_file = os.getenv("OPENCLAW_RECORD_FILE", "") if os.getenv("OPENCLAW_RECORD_ENABLED", "0") == "1" else ""
@@ -527,11 +534,21 @@ class OpenClawOPDAPIServer:
             logger.warning("[OpenClaw-OPD] failed to write PRM record: %s", e)
 
     # ==========================================================================
-    # Remote PRM methods (OpenAI-compatible Chat Completions / vLLM Completions)
+    # Remote PRM methods — judge / eval only (OpenAI Chat Completions API)
+    #
+    # Teacher log-probs are NEVER computed remotely because per-token
+    # advantage subtraction (teacher_lp - old_lp) requires identical
+    # tokenization between teacher and student.  Remote teacher models
+    # with different vocabularies would produce silently wrong signals.
     # ==========================================================================
 
     async def _query_judge_once_remote(self, judge_prompt: str, vote_id: int) -> dict[str, Any]:
-        """Query remote judge hint via OpenAI Chat Completions API."""
+        """Query remote judge hint via OpenAI Chat Completions API.
+
+        Sends the same judge prompt (system + user messages) as the local
+        path.  The remote model reads the assistant response and next state,
+        then outputs \\boxed{1/-1} and optionally [HINT_START]...[HINT_END].
+        """
         payload = {
             "model": self._remote_judge_model,
             "messages": [{"role": "user", "content": judge_prompt}],
@@ -609,80 +626,15 @@ class OpenClawOPDAPIServer:
             )
             return None
 
-    async def _compute_teacher_log_probs_remote(
-        self, prompt_text: str, response_len: int,
-    ) -> list[float]:
-        """Compute teacher log-probs via remote vLLM Completions API (echo=True).
-
-        Uses vLLM's /v1/completions with echo=True, logprobs=True, max_tokens=0
-        to get per-token logprobs for the entire prompt, then extracts the last
-        ``response_len`` entries as the teacher signal.
-
-        IMPORTANT: The remote teacher model MUST use the same tokenizer as the
-        student model for correct token-level alignment.
-        """
-        payload = {
-            "model": self._remote_teacher_model,
-            "prompt": prompt_text,
-            "max_tokens": 0,
-            "temperature": 0,
-            "echo": True,
-            "logprobs": 1,
-        }
-        headers = {}
-        if self._remote_prm_api_key:
-            headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
-
-        t0 = time.monotonic()
-        async with self._teacher_lp_semaphore:
-            async with httpx.AsyncClient(timeout=None) as client:
-                resp = await client.post(
-                    f"{self._remote_prm_base_url}/completions",
-                    json=payload, headers=headers,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-
-        elapsed = time.monotonic() - t0
-
-        logprobs_data = result["choices"][0].get("logprobs")
-        if not logprobs_data:
-            logger.warning(
-                "[OpenClaw-OPD] Remote teacher: no logprobs in response model=%s",
-                self._remote_teacher_model,
-            )
-            return [0.0] * response_len
-
-        token_logprobs = logprobs_data.get("token_logprobs")
-        if not isinstance(token_logprobs, list):
-            return [0.0] * response_len
-
-        # Drop BOS token (position 0), matching local SGLang path behaviour
-        if len(token_logprobs) > 1:
-            token_logprobs = token_logprobs[1:]
-
-        if len(token_logprobs) >= response_len:
-            teacher_lp = token_logprobs[-response_len:]
-        else:
-            teacher_lp = [0.0] * (response_len - len(token_logprobs)) + token_logprobs
-
-        teacher_lp = [float(x) if x is not None else 0.0 for x in teacher_lp]
-
-        valid = [x for x in teacher_lp if x != 0.0]
-        logger.info(
-            "[OpenClaw-OPD] Remote teacher model=%s response_len=%d "
-            "lp_count=%d lp_mean=%.2f lp_min=%.2f lp_max=%.2f elapsed=%.1fs",
-            self._remote_teacher_model, response_len,
-            len(valid),
-            sum(valid) / len(valid) if valid else 0.0,
-            min(valid) if valid else 0.0,
-            max(valid) if valid else 0.0,
-            elapsed,
-        )
-        return teacher_lp
-
     # ==========================================================================
-    # Local PRM methods (SGLang /generate endpoint)
+    # Local methods (SGLang /generate endpoint)
+    #
+    # When remote judge is disabled, all functions (judge + eval + teacher
+    # log-probs) go through self._prm_url, the local SGLang engine.
+    #
+    # When remote judge is enabled (see _query_judge_once /
+    # _query_prm_eval_once gates below), judge/eval are delegated to the
+    # remote API while teacher log-probs still use this local engine.
     # ==========================================================================
 
     async def _query_judge_once(self, judge_prompt: str, vote_id: int) -> dict[str, Any]:
@@ -952,24 +904,21 @@ class OpenClawOPDAPIServer:
         enhanced_ids = self.tokenizer(enhanced_full_text, add_special_tokens=False)["input_ids"]
         response_len = len(turn_data["response_ids"])
 
-        # ---- Teacher logprobs: remote (vLLM echo) or local (SGLang) ----
-        if self._use_remote_teacher:
-            teacher_log_probs = await self._compute_teacher_log_probs_remote(
-                enhanced_full_text, response_len,
-            )
-        else:
-            teacher_log_probs = await self._compute_teacher_log_probs(enhanced_ids, response_len)
-            # ---- Log teacher LP summary for local path ----
-            tlp_valid = [lp for lp in teacher_log_probs if lp != 0.0]
-            logger.info(
-                "%s[OpenClaw-OPD]  TEACHER (local) session=%s turn=%d lp_count=%d/%-d mean=%.2f min=%.2f max=%.2f%s",
-                _CYAN, session_id, turn_num,
-                len(tlp_valid), len(teacher_log_probs),
-                sum(tlp_valid) / len(tlp_valid) if tlp_valid else 0.0,
-                min(tlp_valid) if tlp_valid else 0.0,
-                max(tlp_valid) if tlp_valid else 0.0,
-                _RESET,
-            )
+        # ---- Teacher log-probs ----
+        # Always computed on the local SGLang engine (same model as student,
+        # same vocabulary) so that per-token advantage  (teacher_lp - old_lp)
+        # compares the same token IDs at every position.
+        teacher_log_probs = await self._compute_teacher_log_probs(enhanced_ids, response_len)
+        tlp_valid = [lp for lp in teacher_log_probs if lp != 0.0]
+        logger.info(
+            "%s[OpenClaw-OPD]  TEACHER session=%s turn=%d lp_count=%d/%-d mean=%.2f min=%.2f max=%.2f%s",
+            _CYAN, session_id, turn_num,
+            len(tlp_valid), len(teacher_log_probs),
+            sum(tlp_valid) / len(tlp_valid) if tlp_valid else 0.0,
+            min(tlp_valid) if tlp_valid else 0.0,
+            max(tlp_valid) if tlp_valid else 0.0,
+            _RESET,
+        )
 
         result: dict[str, Any] = {
             "accepted": True,

@@ -92,12 +92,14 @@ export OPENCLAW_COMBINE_W_OPD="${OPENCLAW_COMBINE_W_OPD:-1.0}"
 export TRAIN_EPOCHS="${TRAIN_EPOCHS:-1}"
 export OPENCLAW_EVAL_MODE="${OPENCLAW_EVAL_MODE:-1}"
 # =============================================================================
-# 远程 PRM 配置（可选，设置后将使用远程 OpenAI-compatible API 替代本地 PRM）
+# 远程 PRM 配置（可选）
+# 设置后，judge/eval 评分将通过远程 OpenAI-compatible API 进行，
+# 使用更强模型的判断能力；teacher logprobs 始终使用本地 SGLang
+# 引擎以确保 token 级别的对齐。
 # =============================================================================
 # export OPENCLAW_REMOTE_PRM_BASE_URL="http://your-vllm-server:8000/v1"
 # export OPENCLAW_REMOTE_PRM_API_KEY="your-api-key"
-# export OPENCLAW_REMOTE_PRM_JUDGE_MODEL="qwen2.5-72b-instruct"   # 用于 judge + eval 的模型
-# export OPENCLAW_REMOTE_PRM_TEACHER_MODEL=""                       # 用于 teacher logprobs（需与 student 同 tokenizer；不设则用本地）
+# export OPENCLAW_REMOTE_PRM_JUDGE_MODEL="qwen2.5-72b-instruct"   # 远程 judge/eval 模型名
 # =============================================================================
 # 创建必要目录
 # =============================================================================
@@ -193,13 +195,17 @@ SGLANG_ARGS=(
 )
 
 # =============================================================================
-# PRM 参数，需修改模型位置
+# 本地 PRM / Teacher 引擎参数
+# 该 SGLang 引擎仅用于计算 teacher_log_probs（OPD 分支），
+# 必须与待训模型使用相同的模型和词表以确保 token 级别对齐。
+# Judge/eval 打分可通过 OPENCLAW_REMOTE_PRM_* 环境变量改由
+# 远程 API 进行（参见上面的远程 PRM 配置区）。
 # =============================================================================
 PRM_ARGS=(
     --prm-enable
     --prm-num-gpus 4
     --prm-num-gpus-per-engine 4
-    --prm-model-path /.../weights/GLM-4.7-Flash
+    --prm-model-path "${HF_CKPT}"  # 必须与学生模型 HF_CKPT 相同，以保证 token 对齐
     --prm-m "${PRM_M:-1}"
     --prm-temperature "${PRM_TEMPERATURE:-0.6}"
     --prm-max-new-tokens "${PRM_MAX_NEW_TOKENS:-4096}"
@@ -284,8 +290,7 @@ RUNTIME_ENV_JSON="{
     \"TRAIN_EPOCHS\": \"${TRAIN_EPOCHS}\",
     \"OPENCLAW_REMOTE_PRM_BASE_URL\": \"${OPENCLAW_REMOTE_PRM_BASE_URL:-}\",
     \"OPENCLAW_REMOTE_PRM_API_KEY\": \"${OPENCLAW_REMOTE_PRM_API_KEY:-}\",
-    \"OPENCLAW_REMOTE_PRM_JUDGE_MODEL\": \"${OPENCLAW_REMOTE_PRM_JUDGE_MODEL:-}\",
-    \"OPENCLAW_REMOTE_PRM_TEACHER_MODEL\": \"${OPENCLAW_REMOTE_PRM_TEACHER_MODEL:-}\"
+    \"OPENCLAW_REMOTE_PRM_JUDGE_MODEL\": \"${OPENCLAW_REMOTE_PRM_JUDGE_MODEL:-}\"
   }
 }"
 
