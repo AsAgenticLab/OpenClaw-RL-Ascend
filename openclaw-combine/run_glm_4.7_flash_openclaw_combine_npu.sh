@@ -92,6 +92,13 @@ export OPENCLAW_COMBINE_W_OPD="${OPENCLAW_COMBINE_W_OPD:-1.0}"
 export TRAIN_EPOCHS="${TRAIN_EPOCHS:-1}"
 export OPENCLAW_EVAL_MODE="${OPENCLAW_EVAL_MODE:-1}"
 # =============================================================================
+# 远程 PRM 配置（可选，设置后将使用远程 OpenAI-compatible API 替代本地 PRM）
+# =============================================================================
+# export OPENCLAW_REMOTE_PRM_BASE_URL="http://your-vllm-server:8000/v1"
+# export OPENCLAW_REMOTE_PRM_API_KEY="your-api-key"
+# export OPENCLAW_REMOTE_PRM_JUDGE_MODEL="qwen2.5-72b-instruct"   # 用于 judge + eval 的模型
+# export OPENCLAW_REMOTE_PRM_TEACHER_MODEL=""                       # 用于 teacher logprobs（需与 student 同 tokenizer；不设则用本地）
+# =============================================================================
 # 创建必要目录
 # =============================================================================
 mkdir -p "${SCRIPT_DIR}/results"
@@ -274,7 +281,11 @@ RUNTIME_ENV_JSON="{
     \"OPENCLAW_EVAL_MODE\": \"${OPENCLAW_EVAL_MODE}\",
     \"OPENCLAW_COMBINE_W_RL\": \"${OPENCLAW_COMBINE_W_RL}\",
     \"OPENCLAW_COMBINE_W_OPD\": \"${OPENCLAW_COMBINE_W_OPD}\",
-    \"TRAIN_EPOCHS\": \"${TRAIN_EPOCHS}\"
+    \"TRAIN_EPOCHS\": \"${TRAIN_EPOCHS}\",
+    \"OPENCLAW_REMOTE_PRM_BASE_URL\": \"${OPENCLAW_REMOTE_PRM_BASE_URL:-}\",
+    \"OPENCLAW_REMOTE_PRM_API_KEY\": \"${OPENCLAW_REMOTE_PRM_API_KEY:-}\",
+    \"OPENCLAW_REMOTE_PRM_JUDGE_MODEL\": \"${OPENCLAW_REMOTE_PRM_JUDGE_MODEL:-}\",
+    \"OPENCLAW_REMOTE_PRM_TEACHER_MODEL\": \"${OPENCLAW_REMOTE_PRM_TEACHER_MODEL:-}\"
   }
 }"
 

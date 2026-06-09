@@ -350,8 +350,41 @@ class OpenClawOPDAPIServer:
         self._prm_tokenizer = None
         if self._prm_enabled:
             prm_path = getattr(args, "prm_model_path", None) or args.hf_checkpoint
+            source_tag = "args.prm_model_path" if getattr(args, "prm_model_path", None) else "args.hf_checkpoint (fallback)"
+            logger.info(
+                "[OpenClaw-OPD] Local PRM model path: %s (from %s)",
+                prm_path, source_tag,
+            )
             self._prm_tokenizer = load_tokenizer(prm_path, trust_remote_code=True)
-            logger.info("[OpenClaw-OPD] PRM enabled: url=%s m=%d", self._prm_url, self._prm_m)
+            logger.info(
+                "[OpenClaw-OPD] Local PRM tokenizer loaded: vocab_size=%d",
+                self._prm_tokenizer.vocab_size,
+            )
+
+        # ---- Remote PRM configuration (optional, overrides local judge/eval/teacher) ----
+        self._remote_prm_base_url = os.getenv("OPENCLAW_REMOTE_PRM_BASE_URL", "").rstrip("/")
+        self._remote_prm_api_key = os.getenv("OPENCLAW_REMOTE_PRM_API_KEY", "")
+        self._remote_judge_model = os.getenv("OPENCLAW_REMOTE_PRM_JUDGE_MODEL", "")
+        self._remote_teacher_model = os.getenv("OPENCLAW_REMOTE_PRM_TEACHER_MODEL", "")
+
+        self._use_remote_judge = bool(self._remote_prm_base_url and self._remote_judge_model)
+        self._use_remote_teacher = bool(self._remote_prm_base_url and self._remote_teacher_model)
+
+        if self._use_remote_judge:
+            logger.info(
+                "[OpenClaw-OPD] Remote judge PRM enabled: url=%s/v1 model=%s m=%d",
+                self._remote_prm_base_url, self._remote_judge_model, self._prm_m,
+            )
+        if self._use_remote_teacher:
+            logger.info(
+                "[OpenClaw-OPD] Remote teacher logprobs enabled: url=%s/v1 model=%s "
+                "(REQUIRES same tokenizer as student model for correct alignment)",
+                self._remote_prm_base_url, self._remote_teacher_model,
+            )
+        elif self._use_remote_judge:
+            logger.info(
+                "[OpenClaw-OPD] Remote teacher NOT configured; teacher logprobs will use local PRM SGLang engine.",
+            )
 
         self._record_file = os.getenv("OPENCLAW_RECORD_FILE", "") if os.getenv("OPENCLAW_RECORD_ENABLED", "0") == "1" else ""
         if self._record_file:
@@ -493,7 +526,170 @@ class OpenClawOPDAPIServer:
         except OSError as e:
             logger.warning("[OpenClaw-OPD] failed to write PRM record: %s", e)
 
+    # ==========================================================================
+    # Remote PRM methods (OpenAI-compatible Chat Completions / vLLM Completions)
+    # ==========================================================================
+
+    async def _query_judge_once_remote(self, judge_prompt: str, vote_id: int) -> dict[str, Any]:
+        """Query remote judge hint via OpenAI Chat Completions API."""
+        payload = {
+            "model": self._remote_judge_model,
+            "messages": [{"role": "user", "content": judge_prompt}],
+            "temperature": self._prm_temperature,
+            "max_tokens": self._prm_max_tokens,
+        }
+        headers = {}
+        if self._remote_prm_api_key:
+            headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
+
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                resp = await client.post(
+                    f"{self._remote_prm_base_url}/chat/completions",
+                    json=payload, headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            raw = data["choices"][0]["message"]["content"]
+            score, hint = _parse_judge_result(raw)
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "[OpenClaw-OPD] Remote judge vote#%d score=%s hint_len=%d model=%s elapsed=%.1fs",
+                vote_id,
+                score if score is not None else "?",
+                len(hint),
+                self._remote_judge_model,
+                elapsed,
+            )
+            return {"vote_id": vote_id, "score": score, "hint": hint, "raw": raw}
+        except Exception as e:
+            logger.warning(
+                "[OpenClaw-OPD] Remote judge vote#%d FAILED model=%s: %s",
+                vote_id, self._remote_judge_model, e,
+            )
+            return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
+
+    async def _query_prm_eval_once_remote(self, prompt_text: str, vote_id: int) -> int | None:
+        """Query remote eval score via OpenAI Chat Completions API."""
+        payload = {
+            "model": self._remote_judge_model,
+            "messages": [{"role": "user", "content": prompt_text}],
+            "temperature": self._prm_temperature,
+            "max_tokens": self._prm_max_tokens,
+        }
+        headers = {}
+        if self._remote_prm_api_key:
+            headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
+
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                resp = await client.post(
+                    f"{self._remote_prm_base_url}/chat/completions",
+                    json=payload, headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            raw = data["choices"][0]["message"]["content"]
+            result = _parse_prm_eval_score(str(raw))
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "[OpenClaw-OPD] Remote eval vote#%d score=%s model=%s elapsed=%.1fs",
+                vote_id,
+                result if result is not None else "?",
+                self._remote_judge_model,
+                elapsed,
+            )
+            return result
+        except Exception as e:
+            logger.warning(
+                "[OpenClaw-OPD] Remote eval vote#%d FAILED model=%s: %s",
+                vote_id, self._remote_judge_model, e,
+            )
+            return None
+
+    async def _compute_teacher_log_probs_remote(
+        self, prompt_text: str, response_len: int,
+    ) -> list[float]:
+        """Compute teacher log-probs via remote vLLM Completions API (echo=True).
+
+        Uses vLLM's /v1/completions with echo=True, logprobs=True, max_tokens=0
+        to get per-token logprobs for the entire prompt, then extracts the last
+        ``response_len`` entries as the teacher signal.
+
+        IMPORTANT: The remote teacher model MUST use the same tokenizer as the
+        student model for correct token-level alignment.
+        """
+        payload = {
+            "model": self._remote_teacher_model,
+            "prompt": prompt_text,
+            "max_tokens": 0,
+            "temperature": 0,
+            "echo": True,
+            "logprobs": 1,
+        }
+        headers = {}
+        if self._remote_prm_api_key:
+            headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
+
+        t0 = time.monotonic()
+        async with self._teacher_lp_semaphore:
+            async with httpx.AsyncClient(timeout=None) as client:
+                resp = await client.post(
+                    f"{self._remote_prm_base_url}/completions",
+                    json=payload, headers=headers,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+
+        elapsed = time.monotonic() - t0
+
+        logprobs_data = result["choices"][0].get("logprobs")
+        if not logprobs_data:
+            logger.warning(
+                "[OpenClaw-OPD] Remote teacher: no logprobs in response model=%s",
+                self._remote_teacher_model,
+            )
+            return [0.0] * response_len
+
+        token_logprobs = logprobs_data.get("token_logprobs")
+        if not isinstance(token_logprobs, list):
+            return [0.0] * response_len
+
+        # Drop BOS token (position 0), matching local SGLang path behaviour
+        if len(token_logprobs) > 1:
+            token_logprobs = token_logprobs[1:]
+
+        if len(token_logprobs) >= response_len:
+            teacher_lp = token_logprobs[-response_len:]
+        else:
+            teacher_lp = [0.0] * (response_len - len(token_logprobs)) + token_logprobs
+
+        teacher_lp = [float(x) if x is not None else 0.0 for x in teacher_lp]
+
+        valid = [x for x in teacher_lp if x != 0.0]
+        logger.info(
+            "[OpenClaw-OPD] Remote teacher model=%s response_len=%d "
+            "lp_count=%d lp_mean=%.2f lp_min=%.2f lp_max=%.2f elapsed=%.1fs",
+            self._remote_teacher_model, response_len,
+            len(valid),
+            sum(valid) / len(valid) if valid else 0.0,
+            min(valid) if valid else 0.0,
+            max(valid) if valid else 0.0,
+            elapsed,
+        )
+        return teacher_lp
+
+    # ==========================================================================
+    # Local PRM methods (SGLang /generate endpoint)
+    # ==========================================================================
+
     async def _query_judge_once(self, judge_prompt: str, vote_id: int) -> dict[str, Any]:
+        # ---- Remote gate ----
+        if self._use_remote_judge:
+            return await self._query_judge_once_remote(judge_prompt, vote_id)
+
         if not self._prm_url:
             return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
         payload = {
@@ -525,6 +721,10 @@ class OpenClawOPDAPIServer:
             return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
 
     async def _query_prm_eval_once(self, prompt_text: str, vote_id: int) -> int | None:
+        # ---- Remote gate ----
+        if self._use_remote_judge:
+            return await self._query_prm_eval_once_remote(prompt_text, vote_id)
+
         if not self._prm_url:
             return None
         payload = {
@@ -674,6 +874,19 @@ class OpenClawOPDAPIServer:
 
         votes = await asyncio.gather(*[self._query_judge_once(judge_prompt, i) for i in range(self._prm_m)])
 
+        # ---- Log judge votes ----
+        for v in votes:
+            score_raw = v.get("score")
+            score_tag = {1: "+1", -1: "-1"}.get(score_raw, str(score_raw) if score_raw is not None else "?")
+            hint_preview = (v.get("hint") or "")[:200]
+            logger.info(
+                "%s[OpenClaw-OPD]  HINT vote#%d session=%s turn=%d score=%s hint=%s%s",
+                _YELLOW if score_raw == 1 else _RED if score_raw == -1 else "",
+                v.get("vote_id", -1), session_id, turn_num, score_tag,
+                hint_preview + ("..." if len(v.get("hint") or "") > 200 else " (empty)" if not hint_preview else ""),
+                _RESET if score_raw in (1, -1) else "",
+            )
+
         if self._eval_mode:
             eval_msgs = _build_prm_eval_prompt(turn_data["response_text"], next_state_text, next_state_role)
             if self._prm_tokenizer:
@@ -720,6 +933,12 @@ class OpenClawOPDAPIServer:
             return {"accepted": False, "teacher_log_probs": None, "hint": "", "votes": votes, "eval_score": eval_score}
 
         hint = selected["hint"].strip()
+        logger.info(
+            "%s[OpenClaw-OPD]  HINT accepted session=%s turn=%d len=%d:\n  %s%s",
+            _GREEN, session_id, turn_num, len(hint),
+            hint[:300] + ("..." if len(hint) > 300 else ""),
+            _RESET,
+        )
         enhanced_messages = _append_hint_to_messages(turn_data["messages"], hint)
         norm_enhanced = _normalize_messages_for_template(enhanced_messages)
         enhanced_prompt_text = self.tokenizer.apply_chat_template(
@@ -732,7 +951,25 @@ class OpenClawOPDAPIServer:
         enhanced_full_text = enhanced_prompt_text + turn_data["response_text"]
         enhanced_ids = self.tokenizer(enhanced_full_text, add_special_tokens=False)["input_ids"]
         response_len = len(turn_data["response_ids"])
-        teacher_log_probs = await self._compute_teacher_log_probs(enhanced_ids, response_len)
+
+        # ---- Teacher logprobs: remote (vLLM echo) or local (SGLang) ----
+        if self._use_remote_teacher:
+            teacher_log_probs = await self._compute_teacher_log_probs_remote(
+                enhanced_full_text, response_len,
+            )
+        else:
+            teacher_log_probs = await self._compute_teacher_log_probs(enhanced_ids, response_len)
+            # ---- Log teacher LP summary for local path ----
+            tlp_valid = [lp for lp in teacher_log_probs if lp != 0.0]
+            logger.info(
+                "%s[OpenClaw-OPD]  TEACHER (local) session=%s turn=%d lp_count=%d/%-d mean=%.2f min=%.2f max=%.2f%s",
+                _CYAN, session_id, turn_num,
+                len(tlp_valid), len(teacher_log_probs),
+                sum(tlp_valid) / len(tlp_valid) if tlp_valid else 0.0,
+                min(tlp_valid) if tlp_valid else 0.0,
+                max(tlp_valid) if tlp_valid else 0.0,
+                _RESET,
+            )
 
         result: dict[str, Any] = {
             "accepted": True,
