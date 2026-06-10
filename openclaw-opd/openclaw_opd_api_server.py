@@ -534,175 +534,151 @@ class OpenClawOPDAPIServer:
             logger.warning("[OpenClaw-OPD] failed to write PRM record: %s", e)
 
     # ==========================================================================
-    # Remote PRM methods — judge / eval only (OpenAI Chat Completions API)
+    # Judge & Eval query methods
     #
-    # Teacher log-probs are NEVER computed remotely because per-token
-    # advantage subtraction (teacher_lp - old_lp) requires identical
-    # tokenization between teacher and student.  Remote teacher models
-    # with different vocabularies would produce silently wrong signals.
+    # When OPENCLAW_REMOTE_PRM_* is configured, these route text→text
+    # requests to a remote OpenAI-compatible API.  Otherwise they talk
+    # to the local SGLang /generate endpoint.  The only difference
+    # between the two paths is the payload format and target URL;
+    # sampling parameters, parsing, error handling, and logging are
+    # identical across both.
+    #
+    # Teacher log-probs (_compute_teacher_log_probs below) ALWAYS use
+    # the local SGLang engine for correct token-level alignment.
     # ==========================================================================
 
-    async def _query_judge_once_remote(self, judge_prompt: str, vote_id: int) -> dict[str, Any]:
-        """Query remote judge hint via OpenAI Chat Completions API.
-
-        Sends the same judge prompt (system + user messages) as the local
-        path.  The remote model reads the assistant response and next state,
-        then outputs \\boxed{1/-1} and optionally [HINT_START]...[HINT_END].
-        """
-        payload = {
-            "model": self._remote_judge_model,
-            "messages": [{"role": "user", "content": judge_prompt}],
-            "temperature": self._prm_temperature,
-            "max_tokens": self._prm_max_tokens,
-        }
-        headers = {}
-        if self._remote_prm_api_key:
-            headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
+    async def _query_judge_once(self, judge_prompt: str, vote_id: int) -> dict[str, Any]:
+        if self._use_remote_judge:
+            # ---- Remote path: OpenAI Chat Completions API ----
+            payload = {
+                "model": self._remote_judge_model,
+                "messages": [{"role": "user", "content": judge_prompt}],
+                "temperature": self._prm_temperature,
+                "max_tokens": self._prm_max_tokens,
+            }
+            headers = {}
+            if self._remote_prm_api_key:
+                headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
+            url = f"{self._remote_prm_base_url}/chat/completions"
+            tag = f"remote model={self._remote_judge_model}"
+        else:
+            # ---- Local path: SGLang /generate endpoint ----
+            if not self._prm_url:
+                return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
+            payload = {
+                "text": judge_prompt,
+                "sampling_params": {
+                    "temperature": self._prm_temperature,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_new_tokens": self._prm_max_tokens,
+                    "skip_special_tokens": False,
+                    "no_stop_trim": True,
+                    "spaces_between_special_tokens": False,
+                },
+                "return_logprob": False,
+            }
+            headers = {}
+            url = self._prm_url
+            tag = "local SGLang"
 
         t0 = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                resp = await client.post(
-                    f"{self._remote_prm_base_url}/chat/completions",
-                    json=payload, headers=headers,
-                )
+                resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
-            raw = data["choices"][0]["message"]["content"]
+
+            # ---- Unified response parsing ----
+            if self._use_remote_judge:
+                raw = data["choices"][0]["message"]["content"]
+            else:
+                raw = data.get("text", data) if isinstance(data, dict) else str(data)
+                if isinstance(raw, list):
+                    raw = raw[0] if raw else ""
+            raw = str(raw)
             score, hint = _parse_judge_result(raw)
             elapsed = time.monotonic() - t0
             logger.info(
-                "[OpenClaw-OPD] Remote judge vote#%d score=%s hint_len=%d model=%s elapsed=%.1fs",
+                "[OpenClaw-OPD] judge vote#%d score=%s hint_len=%d %s elapsed=%.1fs",
                 vote_id,
                 score if score is not None else "?",
-                len(hint),
-                self._remote_judge_model,
+                len(hint) if hint else 0,
+                tag,
                 elapsed,
             )
             return {"vote_id": vote_id, "score": score, "hint": hint, "raw": raw}
         except Exception as e:
             logger.warning(
-                "[OpenClaw-OPD] Remote judge vote#%d FAILED model=%s: %s",
-                vote_id, self._remote_judge_model, e,
+                "[OpenClaw-OPD] judge vote#%d FAILED (%s): %s",
+                vote_id, tag, e,
             )
             return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
 
-    async def _query_prm_eval_once_remote(self, prompt_text: str, vote_id: int) -> int | None:
-        """Query remote eval score via OpenAI Chat Completions API."""
-        payload = {
-            "model": self._remote_judge_model,
-            "messages": [{"role": "user", "content": prompt_text}],
-            "temperature": self._prm_temperature,
-            "max_tokens": self._prm_max_tokens,
-        }
-        headers = {}
-        if self._remote_prm_api_key:
-            headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
+    async def _query_prm_eval_once(self, prompt_text: str, vote_id: int) -> int | None:
+        if self._use_remote_judge:
+            # ---- Remote path: OpenAI Chat Completions API ----
+            payload = {
+                "model": self._remote_judge_model,
+                "messages": [{"role": "user", "content": prompt_text}],
+                "temperature": self._prm_temperature,
+                "max_tokens": self._prm_max_tokens,
+            }
+            headers = {}
+            if self._remote_prm_api_key:
+                headers["Authorization"] = f"Bearer {self._remote_prm_api_key}"
+            url = f"{self._remote_prm_base_url}/chat/completions"
+            tag = f"remote model={self._remote_judge_model}"
+        else:
+            # ---- Local path: SGLang /generate endpoint ----
+            if not self._prm_url:
+                return None
+            payload = {
+                "text": prompt_text,
+                "sampling_params": {
+                    "temperature": self._prm_temperature,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_new_tokens": self._prm_max_tokens,
+                    "skip_special_tokens": False,
+                    "no_stop_trim": True,
+                    "spaces_between_special_tokens": False,
+                },
+                "return_logprob": False,
+            }
+            headers = {}
+            url = self._prm_url
+            tag = "local SGLang"
 
         t0 = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                resp = await client.post(
-                    f"{self._remote_prm_base_url}/chat/completions",
-                    json=payload, headers=headers,
-                )
+                resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
-            raw = data["choices"][0]["message"]["content"]
+
+            # ---- Unified response parsing ----
+            if self._use_remote_judge:
+                raw = data["choices"][0]["message"]["content"]
+            else:
+                raw = data.get("text", data) if isinstance(data, dict) else str(data)
+                if isinstance(raw, list):
+                    raw = raw[0] if raw else ""
             result = _parse_prm_eval_score(str(raw))
             elapsed = time.monotonic() - t0
             logger.info(
-                "[OpenClaw-OPD] Remote eval vote#%d score=%s model=%s elapsed=%.1fs",
+                "[OpenClaw-OPD] eval vote#%d score=%s %s elapsed=%.1fs",
                 vote_id,
                 result if result is not None else "?",
-                self._remote_judge_model,
+                tag,
                 elapsed,
             )
             return result
         except Exception as e:
             logger.warning(
-                "[OpenClaw-OPD] Remote eval vote#%d FAILED model=%s: %s",
-                vote_id, self._remote_judge_model, e,
+                "[OpenClaw-OPD] eval vote#%d FAILED (%s): %s",
+                vote_id, tag, e,
             )
-            return None
-
-    # ==========================================================================
-    # Local methods (SGLang /generate endpoint)
-    #
-    # When remote judge is disabled, all functions (judge + eval + teacher
-    # log-probs) go through self._prm_url, the local SGLang engine.
-    #
-    # When remote judge is enabled (see _query_judge_once /
-    # _query_prm_eval_once gates below), judge/eval are delegated to the
-    # remote API while teacher log-probs still use this local engine.
-    # ==========================================================================
-
-    async def _query_judge_once(self, judge_prompt: str, vote_id: int) -> dict[str, Any]:
-        # ---- Remote gate ----
-        if self._use_remote_judge:
-            return await self._query_judge_once_remote(judge_prompt, vote_id)
-
-        if not self._prm_url:
-            return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
-        payload = {
-            "text": judge_prompt,
-            "sampling_params": {
-                "temperature": self._prm_temperature,
-                "top_p": 1.0,
-                "top_k": -1,
-                "max_new_tokens": self._prm_max_tokens,
-                "skip_special_tokens": False,
-                "no_stop_trim": True,
-                "spaces_between_special_tokens": False,
-            },
-            "return_logprob": False,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                resp = await client.post(self._prm_url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-            raw = data.get("text", data) if isinstance(data, dict) else str(data)
-            if isinstance(raw, list):
-                raw = raw[0] if raw else ""
-            raw = str(raw)
-            score, hint = _parse_judge_result(raw)
-            return {"vote_id": vote_id, "score": score, "hint": hint, "raw": raw}
-        except Exception as e:
-            logger.warning("[OpenClaw-OPD] judge query failed (vote %d): %s", vote_id, e)
-            return {"vote_id": vote_id, "score": None, "hint": "", "raw": ""}
-
-    async def _query_prm_eval_once(self, prompt_text: str, vote_id: int) -> int | None:
-        # ---- Remote gate ----
-        if self._use_remote_judge:
-            return await self._query_prm_eval_once_remote(prompt_text, vote_id)
-
-        if not self._prm_url:
-            return None
-        payload = {
-            "text": prompt_text,
-            "sampling_params": {
-                "temperature": self._prm_temperature,
-                "top_p": 1.0,
-                "top_k": -1,
-                "max_new_tokens": self._prm_max_tokens,
-                "skip_special_tokens": False,
-                "no_stop_trim": True,
-                "spaces_between_special_tokens": False,
-            },
-            "return_logprob": False,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                resp = await client.post(self._prm_url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-            raw = data.get("text", data) if isinstance(data, dict) else str(data)
-            if isinstance(raw, list):
-                raw = raw[0] if raw else ""
-            return _parse_prm_eval_score(str(raw))
-        except Exception as e:
-            logger.warning("[OpenClaw-OPD] PRM eval query failed (vote %d): %s", vote_id, e)
             return None
 
     async def _compute_teacher_log_probs(self, input_ids: list[int], response_len: int) -> list[float]:
@@ -826,19 +802,6 @@ class OpenClawOPDAPIServer:
 
         votes = await asyncio.gather(*[self._query_judge_once(judge_prompt, i) for i in range(self._prm_m)])
 
-        # ---- Log judge votes ----
-        for v in votes:
-            score_raw = v.get("score")
-            score_tag = {1: "+1", -1: "-1"}.get(score_raw, str(score_raw) if score_raw is not None else "?")
-            hint_preview = (v.get("hint") or "")[:200]
-            logger.info(
-                "%s[OpenClaw-OPD]  HINT vote#%d session=%s turn=%d score=%s hint=%s%s",
-                _YELLOW if score_raw == 1 else _RED if score_raw == -1 else "",
-                v.get("vote_id", -1), session_id, turn_num, score_tag,
-                hint_preview + ("..." if len(v.get("hint") or "") > 200 else " (empty)" if not hint_preview else ""),
-                _RESET if score_raw in (1, -1) else "",
-            )
-
         if self._eval_mode:
             eval_msgs = _build_prm_eval_prompt(turn_data["response_text"], next_state_text, next_state_role)
             if self._prm_tokenizer:
@@ -885,12 +848,6 @@ class OpenClawOPDAPIServer:
             return {"accepted": False, "teacher_log_probs": None, "hint": "", "votes": votes, "eval_score": eval_score}
 
         hint = selected["hint"].strip()
-        logger.info(
-            "%s[OpenClaw-OPD]  HINT accepted session=%s turn=%d len=%d:\n  %s%s",
-            _GREEN, session_id, turn_num, len(hint),
-            hint[:300] + ("..." if len(hint) > 300 else ""),
-            _RESET,
-        )
         enhanced_messages = _append_hint_to_messages(turn_data["messages"], hint)
         norm_enhanced = _normalize_messages_for_template(enhanced_messages)
         enhanced_prompt_text = self.tokenizer.apply_chat_template(
@@ -909,16 +866,6 @@ class OpenClawOPDAPIServer:
         # same vocabulary) so that per-token advantage  (teacher_lp - old_lp)
         # compares the same token IDs at every position.
         teacher_log_probs = await self._compute_teacher_log_probs(enhanced_ids, response_len)
-        tlp_valid = [lp for lp in teacher_log_probs if lp != 0.0]
-        logger.info(
-            "%s[OpenClaw-OPD]  TEACHER session=%s turn=%d lp_count=%d/%-d mean=%.2f min=%.2f max=%.2f%s",
-            _CYAN, session_id, turn_num,
-            len(tlp_valid), len(teacher_log_probs),
-            sum(tlp_valid) / len(tlp_valid) if tlp_valid else 0.0,
-            min(tlp_valid) if tlp_valid else 0.0,
-            max(tlp_valid) if tlp_valid else 0.0,
-            _RESET,
-        )
 
         result: dict[str, Any] = {
             "accepted": True,
