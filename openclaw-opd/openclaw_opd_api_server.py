@@ -414,6 +414,23 @@ class OpenClawOPDAPIServer:
         if self._eval_mode:
             logger.info("[OpenClaw-OPD] eval mode enabled: will compute RL-style PRM scores")
 
+        # ---- Detailed PRM debug log (optional, off by default) ----
+        # When OPENCLAW_DETAILED_PRM_LOG=1, every PRM evaluation round
+        # writes a full record (timestamp, session, question, answer,
+        # user feedback, PRM raw output, hint, score) to a .jsonl file.
+        self._detailed_prm_log_enabled = os.getenv("OPENCLAW_DETAILED_PRM_LOG", "0") == "1"
+        self._detailed_prm_log_file = ""
+        if self._detailed_prm_log_enabled:
+            self._detailed_prm_log_file = os.getenv(
+                "OPENCLAW_DETAILED_PRM_LOG_FILE",
+                os.path.join(os.path.dirname(self._record_file or "."), "detailed_prm.jsonl"),
+            )
+            os.makedirs(os.path.dirname(self._detailed_prm_log_file), exist_ok=True)
+            logger.info(
+                "[OpenClaw-OPD] Detailed PRM log enabled → %s",
+                self._detailed_prm_log_file,
+            )
+
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self.app = self._build_app()
@@ -791,6 +808,70 @@ class OpenClawOPDAPIServer:
             [list(range(K))] * pad_len + all_indices,
         )
 
+    def _write_detailed_prm_record(
+        self,
+        session_id: str,
+        turn_num: int,
+        turn_data: dict[str, Any],
+        next_state: dict[str, Any],
+        votes: list[dict[str, Any]],
+        selected_hint: str,
+        eval_score: float | None,
+        hint_accepted: bool,
+    ):
+        """Write one line of detailed PRM evaluation info to a .jsonl file.
+
+        Called from _opd_evaluate after all votes are in.  Captures the full
+        picture: what the assistant was asked, what it answered, what the
+        user said next, and how the PRM judged the interaction.
+        """
+        if not self._detailed_prm_log_enabled or not self._detailed_prm_log_file:
+            return
+
+        # ---- Extract last user question from the conversation ----
+        messages = turn_data.get("messages") or []
+        last_question = ""
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_question = _flatten_message_content(m.get("content"))
+                break
+
+        # ---- Assemble the record ----
+        record: dict[str, Any] = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "session_id": session_id,
+            "turn": turn_num,
+            "last_question": last_question,
+            "last_answer": turn_data.get("response_text", ""),
+            "user_response": (
+                _flatten_message_content(next_state.get("content"))
+                if next_state else ""
+            ),
+            "user_response_role": next_state.get("role", "user") if next_state else "",
+            "hint_accepted": hint_accepted,
+            "selected_hint": selected_hint or "",
+            "eval_score": eval_score,
+            "prm_raw_output": "\n\n---\n\n".join(
+                v.get("raw", "") for v in (votes or [])
+            ),
+            "prm_votes": [
+                {
+                    "vote_id": v.get("vote_id", -1),
+                    "score": v.get("score"),
+                    "hint": (v.get("hint") or "")[:500],
+                    "raw": (v.get("raw") or "")[:3000],
+                }
+                for v in (votes or [])
+            ],
+        }
+
+        # Append one JSON object per line
+        try:
+            with open(self._detailed_prm_log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logger.warning("[OpenClaw-OPD] failed to write detailed PRM record: %s", e)
+
     async def _opd_evaluate(self, session_id: str, turn_num: int, turn_data: dict[str, Any], next_state: dict[str, Any]) -> dict[str, Any]:
         next_state_text = _flatten_message_content(next_state.get("content")) if next_state else ""
         next_state_role = next_state.get("role", "user") if next_state else "user"
@@ -826,6 +907,19 @@ class OpenClawOPDAPIServer:
 
         selected = _select_best_hint(votes)
         votes_display = [v.get("score", "fail") for v in votes]
+
+        # ---- Write detailed PRM record (optional, off by default) ----
+        hint_text = selected["hint"].strip() if selected else ""
+        self._write_detailed_prm_record(
+            session_id=session_id,
+            turn_num=turn_num,
+            turn_data=turn_data,
+            next_state=next_state,
+            votes=votes,
+            selected_hint=hint_text,
+            eval_score=eval_score,
+            hint_accepted=selected is not None,
+        )
 
         if selected is None:
             logger.info(

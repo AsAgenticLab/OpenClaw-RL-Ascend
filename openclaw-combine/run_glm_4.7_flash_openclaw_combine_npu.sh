@@ -101,6 +101,14 @@ export OPENCLAW_EVAL_MODE="${OPENCLAW_EVAL_MODE:-1}"
 # export OPENCLAW_REMOTE_PRM_API_KEY="your-api-key"
 # export OPENCLAW_REMOTE_PRM_JUDGE_MODEL="qwen2.5-72b-instruct"   # 远程 judge/eval 模型名
 # =============================================================================
+# 详细 PRM 调试日志（可选，默认关闭）
+# 开启后每次 PRM 评判都会写入一条完整记录到 .jsonl 文件，
+# 包含：时间、session_id、原始问题、原始回答、用户反馈、
+#       PRM 原始输出、hint 原文、eval_score 等。
+# =============================================================================
+# export OPENCLAW_DETAILED_PRM_LOG=1
+# export OPENCLAW_DETAILED_PRM_LOG_FILE="${SCRIPT_DIR}/results/detailed_prm.jsonl"  # 默认路径
+# =============================================================================
 # 创建必要目录
 # =============================================================================
 mkdir -p "${SCRIPT_DIR}/results"
@@ -290,7 +298,9 @@ RUNTIME_ENV_JSON="{
     \"TRAIN_EPOCHS\": \"${TRAIN_EPOCHS}\",
     \"OPENCLAW_REMOTE_PRM_BASE_URL\": \"${OPENCLAW_REMOTE_PRM_BASE_URL:-}\",
     \"OPENCLAW_REMOTE_PRM_API_KEY\": \"${OPENCLAW_REMOTE_PRM_API_KEY:-}\",
-    \"OPENCLAW_REMOTE_PRM_JUDGE_MODEL\": \"${OPENCLAW_REMOTE_PRM_JUDGE_MODEL:-}\"
+    \"OPENCLAW_REMOTE_PRM_JUDGE_MODEL\": \"${OPENCLAW_REMOTE_PRM_JUDGE_MODEL:-}\",
+    \"OPENCLAW_DETAILED_PRM_LOG\": \"${OPENCLAW_DETAILED_PRM_LOG:-}\",
+    \"OPENCLAW_DETAILED_PRM_LOG_FILE\": \"${OPENCLAW_DETAILED_PRM_LOG_FILE:-}\"
   }
 }"
 
