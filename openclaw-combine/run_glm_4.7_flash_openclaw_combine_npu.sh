@@ -94,20 +94,19 @@ export OPENCLAW_EVAL_MODE="${OPENCLAW_EVAL_MODE:-1}"
 # =============================================================================
 # 远程 PRM 配置（可选）
 # 设置后，judge/eval 评分将通过远程 OpenAI-compatible API 进行，
-# 使用更强模型的判断能力；teacher logprobs 始终使用本地 SGLang
-# 引擎以确保 token 级别的对齐。
+# 使用更强模型的判断能力；teacher logprobs 始终使用本地 SGLang 引擎以确保 token 级别的对齐。
 # =============================================================================
-# export OPENCLAW_REMOTE_PRM_BASE_URL="http://your-vllm-server:8000/v1"
-# export OPENCLAW_REMOTE_PRM_API_KEY="your-api-key"
-# export OPENCLAW_REMOTE_PRM_JUDGE_MODEL="qwen2.5-72b-instruct"   # 远程 judge/eval 模型名
+export OPENCLAW_REMOTE_PRM_BASE_URL="http://your-vllm-server:8000/v1"
+export OPENCLAW_REMOTE_PRM_API_KEY="your-api-key"
+export OPENCLAW_REMOTE_PRM_JUDGE_MODEL="qwen"   # 远程 judge/eval 模型名
 # =============================================================================
 # 详细 PRM 调试日志（可选，默认关闭）
 # 开启后每次 PRM 评判都会写入一条完整记录到 .jsonl 文件，
 # 包含：时间、session_id、原始问题、原始回答、用户反馈、
 #       PRM 原始输出、hint 原文、eval_score 等。
 # =============================================================================
-# export OPENCLAW_DETAILED_PRM_LOG=1
-# export OPENCLAW_DETAILED_PRM_LOG_FILE="${SCRIPT_DIR}/results/detailed_prm.jsonl"  # 默认路径
+export OPENCLAW_DETAILED_PRM_LOG=0
+export OPENCLAW_DETAILED_PRM_LOG_FILE="${SCRIPT_DIR}/results/run_glm4.7_flash_detailed_prm.jsonl"  # 默认路径
 # =============================================================================
 # 创建必要目录
 # =============================================================================
