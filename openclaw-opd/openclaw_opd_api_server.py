@@ -814,7 +814,8 @@ class OpenClawOPDAPIServer:
         turn_num: int,
         turn_data: dict[str, Any],
         next_state: dict[str, Any],
-        votes: list[dict[str, Any]],
+        hint_votes: list[dict[str, Any]],
+        eval_votes: list[int | None],
         selected_hint: str,
         eval_score: float | None,
         hint_accepted: bool,
@@ -824,6 +825,10 @@ class OpenClawOPDAPIServer:
         Called from _opd_evaluate after all votes are in.  Captures the full
         picture: what the assistant was asked, what it answered, what the
         user said next, and how the PRM judged the interaction.
+
+        hint_votes: from _query_judge_once (hint extraction) — each is a dict
+                    with vote_id, score (±1), hint text, raw output.
+        eval_votes: from _query_prm_eval_once (RL scoring) — list of ints or None.
         """
         if not self._detailed_prm_log_enabled or not self._detailed_prm_log_file:
             return
@@ -837,10 +842,16 @@ class OpenClawOPDAPIServer:
                 break
 
         # ---- Assemble the record ----
+        prm_source = (
+            f"remote:{self._remote_judge_model}"
+            if self._use_remote_judge
+            else "local SGLang"
+        )
         record: dict[str, Any] = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "session_id": session_id,
             "turn": turn_num,
+            "prm_source": prm_source,
             "last_question": last_question,
             "last_answer": turn_data.get("response_text", ""),
             "user_response": (
@@ -851,17 +862,18 @@ class OpenClawOPDAPIServer:
             "hint_accepted": hint_accepted,
             "selected_hint": selected_hint or "",
             "eval_score": eval_score,
-            "prm_raw_output": "\n\n---\n\n".join(
-                v.get("raw", "") for v in (votes or [])
-            ),
-            "prm_votes": [
+            "hint_judge_votes": [
                 {
                     "vote_id": v.get("vote_id", -1),
                     "score": v.get("score"),
                     "hint": (v.get("hint") or "")[:500],
                     "raw": (v.get("raw") or "")[:3000],
                 }
-                for v in (votes or [])
+                for v in (hint_votes or [])
+            ],
+            "eval_judge_votes": [
+                s if s is not None else "fail"
+                for s in (eval_votes or [])
             ],
         }
 
@@ -915,7 +927,8 @@ class OpenClawOPDAPIServer:
             turn_num=turn_num,
             turn_data=turn_data,
             next_state=next_state,
-            votes=votes,
+            hint_votes=votes,
+            eval_votes=list(eval_raw) if self._eval_mode else [],
             selected_hint=hint_text,
             eval_score=eval_score,
             hint_accepted=selected is not None,
