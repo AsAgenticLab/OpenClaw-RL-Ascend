@@ -440,8 +440,12 @@ class OpenClawOPDAPIServer:
         app.state.owner = self
 
         @app.get("/healthz")
-        async def healthz():
-            return {"ok": True}
+        async def healthz(request: Request):
+            owner: OpenClawOPDAPIServer = request.app.state.owner
+            return {
+                "ok": True,
+                "accepting": owner.submission_enabled.is_set(),
+            }
 
         @app.post("/v1/chat/completions")
         async def chat_completions(
