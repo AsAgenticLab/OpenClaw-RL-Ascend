@@ -1,0 +1,14 @@
+{
+  "name": "@openclaw/opencode-rl-headers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Injects X-Session-Id, X-Turn-Type and X-Session-Done headers into OpenCode LLM requests so the OpenClaw-RL proxy can collect training data, mirroring the OpenClaw rl-training-headers extension.",
+  "main": "index.ts",
+  "opencode": {
+    "plugin": "./index.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.17.3"
+  }
+}
