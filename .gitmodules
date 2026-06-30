@@ -1,4 +1,4 @@
 [submodule "slime-ascend"]
 	path = slime-ascend
 	url = https://gitcode.com/Ascend-SACT/slime-ascend-for-OpenClaw-RL.git
-	branch = v0.2.2
+	branch = v0.2.2-OpenClaw-RL
