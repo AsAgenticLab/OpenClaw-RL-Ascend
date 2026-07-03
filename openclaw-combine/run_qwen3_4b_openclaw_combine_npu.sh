@@ -1,23 +1,20 @@
 #!/bin/bash
 # =============================================================================
 # OpenClaw-RL Personal Optimization — Combination Method (Binary RL + OPD)
-# 昇腾 A3 双机适配版本 (2 × 16 NPU = 32 NPU)
+# Ascend A3 single-node version (1 × 16 NPU)
 #
-# 用法（在 Node0 主节点上执行）：
-#   1. 先在 Node0 上运行本脚本（内含 ray start --head）
-#   2. 在 Node1 从节点上运行：
-#        ray start --address=<NODE0_IP>:6379 --num-gpus 16
-#   3. ray job 已在本脚本末尾自动提交
+# Usage (run on a single node):
+#   1. Run this script directly (includes ray start --head internally)
+#   2. ray job is automatically submitted at the end of this script
 #
-# 资源分配（32 NPU 总计）：
-#   Actor (训练)  : 2 nodes × 8 NPU = 16 NPU  (TP=4, 2 DP/node)
-#   Rollout (推理): 8 NPU                       (SGLang TP=2, 4 engines)
-#   PRM (评判)    : 8 NPU                       (SGLang TP=2, 4 engines)
+# Resource allocation (12 NPU total):
+#   Actor (train)  : 4 NPU  (TP=4)
+#   Rollout (infer): 4 NPU  (SGLang TP=1, 4 engines)
+#   PRM (judge)    : 4 NPU  (SGLang TP=1, 4 engines)
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 清理残留进程（重新运行时复位环境）
-# 注意：Node1 需在本脚本 ray start --head 之后、ray job submit 之前手动加入
+# Clean up residual processes (reset environment for re-run)
 # -----------------------------------------------------------------------------
 pkill -9 sglang
 sleep 3
@@ -52,7 +49,7 @@ export RAY_health_check_timeout_ms=30000
 export RAY_num_heartbeats_timeout=60
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-# 指向 slime-ascend（而非 slime）
+# Point to slime-ascend (not slime)
 SLIME_DIR="$(cd -- "${SCRIPT_DIR}/../slime-ascend" &>/dev/null && pwd)"
 MEGATRON_LM_PATH=${MEGATRON_LM_PATH:-"/workspace/Megatron-LM"}
 MEGATRON_BRIDGE_PATH=${MEGATRON_BRIDGE_PATH:-"/workspace/Megatron-Bridge/src"}
@@ -61,14 +58,15 @@ SLIME_ASCEND_ROOT=${SLIME_ASCEND_ROOT:-"/workspace/OpenClaw-RL/slime-ascend"}
 
 source "${SLIME_DIR}/scripts/models/qwen3-4B.sh"
 
-# 修改如下的模型位置
+# Modify the model paths below
 HF_CKPT=${HF_CKPT:-/.../weights/Qwen3-4B-Instruct-2507}
 REF_LOAD=${REF_LOAD:-/.../weights/Qwen3-4B-Instruct-2507_torch_dist}
 SAVE_CKPT=${SAVE_CKPT:-}
 
 # =============================================================================
-# OpenClaw API Server 配置
-# 这些变量由 openclaw_combine_api_server.py 读取，必须包含在 RUNTIME_ENV_JSON 中
+# OpenClaw API Server config
+# These variables are read by openclaw_combine_api_server.py and must be
+# included in RUNTIME_ENV_JSON
 # =============================================================================
 export SGLANG_API_KEY="${SGLANG_API_KEY:-sk-1234}"
 export SERVED_MODEL_NAME="qwen3-4b"
@@ -88,7 +86,7 @@ export OPENCLAW_COMBINE_W_OPD="${OPENCLAW_COMBINE_W_OPD:-1.0}"
 export TRAIN_EPOCHS="${TRAIN_EPOCHS:-2}"
 export OPENCLAW_EVAL_MODE="${OPENCLAW_EVAL_MODE:-1}"
 # =============================================================================
-# 创建必要目录
+# Create necessary directories
 # =============================================================================
 mkdir -p "${SCRIPT_DIR}/results"
 #mkdir -p "${SAVE_CKPT}"
@@ -102,7 +100,7 @@ CKPT_ARGS=(
 )
 
 # =============================================================================
-# Rollout 参数（OpenClaw 异步对话驱动，无固定数据集）
+# Rollout parameters (OpenClaw async conversation-driven, no fixed dataset)
 # =============================================================================
 ROLLOUT_ARGS=(
     --disable-rollout-global-dataset
@@ -120,7 +118,7 @@ ROLLOUT_ARGS=(
 )
 
 # =============================================================================
-# Megatron 参数
+# Megatron parameters
 # TP4 DP1
 # =============================================================================
 PERF_ARGS=(
@@ -141,7 +139,7 @@ PERF_ARGS=(
 )
 
 # =============================================================================
-# Combination Loss 参数（GRPO + OPD 联合损失）
+# Combination Loss parameters (GRPO + OPD joint loss)
 # =============================================================================
 COMBINE_ARGS=(
     --advantage-estimator grpo
@@ -177,7 +175,10 @@ SGLANG_ARGS=(
 )
 
 # =============================================================================
-# PRM 参数，需修改模型位置
+# Local PRM / Teacher engine parameters
+# This SGLang engine computes teacher_log_probs for the OPD branch.
+# The teacher model does NOT need to be identical to the student model;
+# only the tokenizer / vocabulary must match for token-level alignment.
 # =============================================================================
 PRM_ARGS=(
     --prm-enable
@@ -191,7 +192,7 @@ PRM_ARGS=(
 
 
 # =============================================================================
-# 其他 Megatron 参数
+# Other Megatron parameters
 # =============================================================================
 MISC_ARGS=(
     --attention-dropout 0.0
@@ -203,7 +204,7 @@ MISC_ARGS=(
 )
 
 # =============================================================================
-# 自定义函数路径（OpenClaw Combine API 服务 & 奖励函数）
+# Custom function paths (OpenClaw Combine API service & reward function)
 # =============================================================================
 CUSTOM_ARGS=(
     --custom-generate-function-path openclaw_combine_api_server.generate
@@ -222,18 +223,18 @@ ray start --head --node-ip-address ${MASTER_ADDR} \
 
 
 # =============================================================================
-# 提交 Ray Job
+# Submit Ray Job
 #
-# PYTHONPATH 说明：
-#   - MEGATRON_LM_PATH       : Megatron-LM 核心（必须）
-#   - MEGATRON_BRIDGE_PATH   : Megatron-Bridge（必须）
-#   - SGLANG_PYTHON_PATH     : SGLang Python 包（若未 pip install 则需要）
-#   - SCRIPT_DIR             : openclaw-combine/ 目录（含 combine_loss.py 等）
-#   - openclaw-opd 目录       : openclaw_opd_api_server.py（被 combine 导入）
-#   - SLIME_ASCEND_ROOT      : slime-ascend 包（若未 pip install -e 则需要）
+# PYTHONPATH notes:
+#   - MEGATRON_LM_PATH       : Megatron-LM core (required)
+#   - MEGATRON_BRIDGE_PATH   : Megatron-Bridge (required)
+#   - SGLANG_PYTHON_PATH     : SGLang Python package (needed if not pip installed)
+#   - SCRIPT_DIR             : openclaw-combine/ directory (contains combine_loss.py, etc.)
+#   - openclaw-opd directory  : openclaw_opd_api_server.py (imported by combine)
+#   - SLIME_ASCEND_ROOT      : slime-ascend package (needed if not pip install -e)
 #
-# 多机注意：RUNTIME_ENV_JSON 中的 env_vars 会同步到所有 Ray worker 节点，
-#           包括 Node1，因此所有必需的 NPU 环境变量都必须列在这里。
+# RUNTIME_ENV_JSON env_vars are synced to all Ray worker nodes;
+# all required NPU environment variables must be listed here.
 # =============================================================================
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
