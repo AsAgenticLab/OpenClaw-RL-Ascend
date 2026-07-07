@@ -14,8 +14,6 @@ OpenClaw-RL-Ascend is an adaptation of the open-source project [OpenClaw-RL](htt
 
 > See the original upstream project README: [OpenClaw-RL](./README_opensource.md)
 
-> See the original opensource repo on [GitHub](https://github.com/Gen-Verse/OpenClaw-RL)
-
 ---
 
 ## Ascend Adaptations
