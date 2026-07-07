@@ -51,6 +51,7 @@ An **Ascend A3** machine with **16 NPUs** is recommended.
 OpenClaw-RL-Ascend depends on the [slime-ascend](https://github.com/THUDM/slime) training framework. Build the slime-ascend base image first using the official v0.2.2 Dockerfile:
 
 > [Dockerfile.a3.ubuntu22.04.cann850.latest](https://gitcode.com/Ascend/slime-ascend/blob/v0.2.2/docker/npu_docker/v0.2.2/Dockerfile.a3.ubuntu22.04.cann850.latest)
+> [Dockerfile on GitHub](https://github.com/AsAgenticLab/slime-ascend-for-OpenClaw-RL/blob/v0.2.2-OpenClaw-RL/docker/npu_docker/v0.2.2/Dockerfile.a3.ubuntu22.04.cann850.latest)
 
 ### 3. Build the OpenClaw-RL-Ascend Image
 
